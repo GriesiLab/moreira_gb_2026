@@ -1,0 +1,600 @@
+###############################################################################
+# Script:        QC Papa_2018_T3
+# Author:        Gustavo Bueno Moreira
+# Last update:   2026-02-16
+#
+# Purpose:
+#   - Perform an exploratory analysis of RNA-seq data from selected studies,
+#     summarizing sample-level structure and technical variation through
+#     descriptive visualizations and QC outputs.
+#
+# Deliverables:
+#   1) QC report (boxplot, PCA, heatmap, hierarchical clustering) exported to PDF
+#   2) RUVseq exploratory normalization panel exported to PDF (p- and k-grid)
+#   3) PCA outputs: variance explained, PC interpretation heatmap, scree plot,
+#      and top contributing genes per PC exported as tables/figures
+#
+# Inputs:
+#   - `expData`: raw count matrix (genes × samples) loaded from text file
+#   - `metadata`: sample annotations loaded from GEO
+#   - DATA/GSE110968_raw_counts_GRCh38.p13_NCBI.tsv.gz
+#   - DATA/exonicLength_hg19.rda OR DATA/exonicLength_hg38.rda
+#   - DATA/HK_full_gene_list_ensembl_biomart.csv
+#   - Internet access for GEOquery / biomaRt (if conversion is requested)
+#
+# Outputs:
+#   - DATA/metadata.csv
+#   - DATA/raw_counts.csv
+#   - RESULTS/Quality_Control/3_QC_withoutOutliers.pdf
+#   - RUVseq_results_p_<p>.pdf (multiple files, optional)
+#   - DATA/counts_final.csv (optional; only if RUVseq normalization is performed)
+###############################################################################
+
+#### 0) Setup #################################################################
+
+# 0.1) Setup: working directory ------------------------------------------------
+setwd("~/Insync/cgustavobm2018@gmail.com/Google Drive - Shared with me/_Projeto_Pi_Fapesp_2022/4a_Panel_validation_inSilico/Studies_QC/RNAseq/Papa_etal_2018")
+
+# 0.2) Options & constants -----------------------------------------------------
+options(stringsAsFactors = FALSE)
+
+# 0.3) Packages ----------------------------------------------------------------
+library(grid)          # low-level grid graphics (legends, drawing)
+library(tidyr)         # pivot_longer and tidy data helpers
+library(ggplot2)       # plotting and exporting
+library(GEOquery)      # download and parse GEO series data
+library(reshape2)      # reshaping helpers (wide/long)
+library(RColorBrewer)  # palettes for heatmaps
+library(RUVSeq)        # remove unwanted variation (RUVg)
+library(FactoMineR)    # PCA computation
+library(factoextra)    # PCA visualizations (fviz_eig, fviz_contrib)
+library(corrplot)      # correlation matrix visualization
+library(pheatmap)      # heatmap visualization
+library(patchwork)     # combine ggplot objects
+library(gridExtra)     # arrange grobs for multi-panel outputs
+library(ggplot2)       # plotting (duplicated in original script; kept as-is)
+library(MOFA2)         # multi-omics factor analysis
+library(DT)            # interactive tables
+library(psych)         # correlation / factor analysis utilities
+library(NMF)           # non-negative matrix factorization
+library(dplyr)         # data manipulation (mutate, join, distinct)
+library(DESeq2)        # VST and DESeq differential expression results
+library(biomaRt)       # identifier conversion via Ensembl BioMart
+library(UpSetR)        # set intersection visualization
+library(stringr)       # string helpers
+# 0.4) Functions (helpers) -----------------------------------------------------
+
+detect_separator <- function(file_path) {
+  # NOTE: for .gz files, readLines() may fail. Use gzfile() safely.
+  con <- if (grepl("\\.gz$", file_path, ignore.case = TRUE)) gzfile(file_path, "rt") else file(file_path, "rt")
+  first_line <- readLines(con, n = 1)
+  close(con)
+  
+  if (grepl(";", first_line)) {
+    return(";")
+  } else if (grepl(",", first_line)) {
+    return(",")
+  } else if (grepl("\t", first_line)) {
+    return("\t")
+  } else {
+    stop("Separator not recognized. Check the file format.")
+  }
+}
+
+check_id_type <- function(ids) {
+  if (all(grepl("^ENSG\\d{11}$", ids))) {
+    return("Ensembl")
+  } else if (all(grepl("^\\d+$", ids))) {
+    return("Entrez")
+  } else {
+    return("GeneName")
+  }
+}
+
+convert_identifiers <- function(expDataRaw, to_id, mart) {
+  id_type <- check_id_type(expDataRaw[, 1])
+  message("Detected identifier type: ", id_type)
+  
+  if (to_id == "Ensembl") {
+    if (id_type == "Ensembl") {
+      message("Identifiers are already Ensembl. No conversion needed.")
+      return(expDataRaw)
+    }
+    
+    message("Converting identifiers to Ensembl ID...")
+    
+    if (id_type == "Entrez") {
+      attributes <- c("ensembl_gene_id", "entrezgene_id")
+      filters <- "entrezgene_id"
+    } else if (id_type == "GeneName") {
+      attributes <- c("ensembl_gene_id", "hgnc_symbol")
+      filters <- "hgnc_symbol"
+    } else {
+      stop("Unsupported identifier type for conversion to Ensembl.")
+    }
+    
+    geneR <- getBM(
+      attributes = attributes,
+      filters = filters,
+      values = expDataRaw[, 1],
+      mart = mart
+    )
+    
+    colnames(geneR) <- c("Ensembl", "GeneID")
+    geneR$GeneID <- as.character(geneR$GeneID)
+    
+    expDataRaw <- expDataRaw %>%
+      mutate(GeneID = as.character(expDataRaw[, 1])) %>%
+      left_join(geneR, by = "GeneID")
+    
+    missing_ensembl <- sum(is.na(expDataRaw$Ensembl))
+    message("Number of genes without a match in Ensembl: ", missing_ensembl)
+    
+    expDataRaw <- expDataRaw[!is.na(expDataRaw$Ensembl), ]
+    expDataRaw <- expDataRaw %>% distinct(Ensembl, .keep_all = TRUE)
+    
+  } else {
+    stop("This script only standardizes to Ensembl in the QC stage.")
+  }
+  
+  return(expDataRaw)
+}
+
+filter_genes_by_tpm <- function(expData, metadata) {
+  genome <- unique(metadata$Genome_build)
+  
+  if (any(grepl("GRCH19", genome, ignore.case = TRUE))) {
+    load("DATA/exonicLength_hg19.rda")
+    cat("Reference genome identified: GRCh19\n")
+  } else if (any(grepl("GRCH38", genome, ignore.case = TRUE))) {
+    load("DATA/exonicLength_hg38.rda")
+    cat("Reference genome identified: GRCh38\n")
+  } else {
+    stop("Genome not identified in metadata. Check the 'Genome_build' column.")
+  }
+  
+  rownames(exonicLength) <- sapply(strsplit(rownames(exonicLength), "\\."), `[`, 1)
+  
+  gene_length <- as.numeric(exonicLength)
+  names(gene_length) <- rownames(exonicLength)
+  
+  matched_genes <- match(rownames(expData), names(gene_length))
+  gene_length <- gene_length[matched_genes] / 1000
+  
+  rpk <- expData
+  for (j in seq_len(ncol(rpk))) {
+    rpk[, j] <- expData[, j] / gene_length
+  }
+  
+  rpk <- rpk[!is.na(rpk[, 1]), ]
+  
+  libsize <- colSums(rpk) / 10^6
+  tpm <- rpk
+  for (j in seq_len(ncol(tpm))) {
+    tpm[, j] <- rpk[, j] / libsize[j]
+  }
+  
+  n <- as.integer(readline(prompt = "Enter the minimum number of samples with TPM > 1: "))
+  if (is.na(n) || n <= 0) stop("Invalid value for n. It must be a positive integer.")
+  
+  tpm_filtered <- tpm[rowSums(tpm > 1) >= n, ]
+  expData_filtered <- expData[rownames(expData) %in% rownames(tpm_filtered), ]
+  
+  cat("Number of genes after filtering:", nrow(expData_filtered), "\n")
+  return(expData_filtered)
+}
+
+deseq_vst <- function(expData, metadata) {
+  dds <- DESeqDataSetFromMatrix(countData = expData, colData = metadata, design = ~ 1)
+  vsd <- varianceStabilizingTransformation(dds)
+  as.data.frame(assay(vsd))
+}
+
+heatmap_plot <- function(expData, metadata, title = "Heatmap", label_column = NULL) {
+  if (is.null(label_column)) {
+    cat("Available columns in metadata:\n")
+    print(colnames(metadata))
+    label_column <- readline(prompt = "Enter the column name to use for row labels: ")
+  }
+  if (!label_column %in% colnames(metadata)) stop(paste("Column", label_column, "does not exist in metadata."))
+  
+  sampleDists <- dist(t(expData))
+  sampleDistMatrix <- as.matrix(sampleDists)
+  
+  rownames(sampleDistMatrix) <- metadata[[label_column]]
+  colnames(sampleDistMatrix) <- NULL
+  
+  colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+  
+  pheatmap(
+    sampleDistMatrix,
+    clustering_distance_rows = sampleDists,
+    clustering_distance_cols = sampleDists,
+    col = colors,
+    main = title
+  )
+}
+
+sampleClustering_plot <- function(expData, metadata, method = "average", cex_labels = 0.7, label_column = NULL) {
+  if (is.null(label_column)) {
+    cat("Available columns in metadata:\n")
+    print(colnames(metadata))
+    label_column <- readline(prompt = "Enter the column name to use for sample labels: ")
+  }
+  if (!label_column %in% colnames(metadata)) stop(paste("Column", label_column, "does not exist in metadata."))
+  
+  sampleTrees <- hclust(dist(t(expData)), method = method)
+  sampleTrees$labels <- metadata[[label_column]]
+  
+  par(mfrow = c(2, 1))
+  par(mar = c(0, 4, 2, 0))
+  plot(sampleTrees, main = "Sample Clustering", xlab = "", sub = "", cex = cex_labels)
+}
+
+perform_pca <- function(expData, metadata, population_column = NULL, sample_column = NULL) {
+  if (is.null(population_column)) {
+    cat("Available columns in metadata:\n")
+    print(colnames(metadata))
+    population_column <- readline(prompt = "Enter the column name to define colors (Population) or type NA: ")
+    if (toupper(population_column) == "NA") population_column <- NA
+  }
+  
+  if (is.null(sample_column)) {
+    cat("Available columns in metadata:\n")
+    print(colnames(metadata))
+    sample_column <- readline(prompt = "Enter the column name to define shapes (Sample) or type NA: ")
+    if (toupper(sample_column) == "NA") sample_column <- NA
+  }
+  
+  if (is.na(population_column) & is.na(sample_column)) stop("You must provide at least one variable for the plot!")
+  
+  mtx4PCA <- t(expData)
+  
+  pca_results <- PCA(mtx4PCA, scale.unit = FALSE, ncp = 20, graph = FALSE)
+  pca_coordinates <- pca_results$ind$coord
+  
+  variance_explained <- pca_results$eig
+  variance_pc1 <- round(variance_explained[1, 2], 1)
+  variance_pc2 <- round(variance_explained[2, 2], 1)
+  
+  pca_data <- as.data.frame(pca_coordinates)
+  
+  if (!is.na(population_column)) {
+    if (!population_column %in% colnames(metadata)) stop(paste("Column", population_column, "does not exist in metadata."))
+    pca_data <- pca_data %>% mutate(Population = metadata[[population_column]])
+  }
+  
+  if (!is.na(sample_column)) {
+    if (!sample_column %in% colnames(metadata)) stop(paste("Column", sample_column, "does not exist in metadata."))
+    pca_data <- pca_data %>% mutate(Sample = metadata[[sample_column]])
+  }
+  
+  pca_plot <- ggplot(pca_data, aes(x = Dim.1, y = Dim.2)) +
+    geom_point(size = 4) +
+    labs(
+      title = "",
+      x = paste("PC1 (", variance_pc1, "%)", sep = ""),
+      y = paste("PC2 (", variance_pc2, "%)", sep = "")
+    ) +
+    theme_minimal() +
+    theme(
+      axis.line = element_line(color = "black"),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.key = element_blank(),
+      legend.box = "vertical"
+    )
+  
+  if (!is.na(population_column)) {
+    num_colors <- length(unique(na.omit(pca_data$Population)))
+    color_palette <- colorRampPalette(c("red", "blue"))(num_colors)
+    pca_plot <- pca_plot +
+      aes(color = Population) +
+      scale_color_manual(values = setNames(color_palette, sort(unique(na.omit(pca_data$Population))))) +
+      labs(color = "Population")
+  }
+  
+  if (!is.na(sample_column)) {
+    pca_plot <- pca_plot + aes(shape = Sample) + labs(shape = "Sample")
+  }
+  
+  return(list(pca_data = pca_data, pca_plot = pca_plot, pca_results = pca_results))
+}
+
+differential_expression_analysis <- function(expData, metadata) {
+  cat("Available columns in metadata:\n")
+  print(colnames(metadata))
+  
+  design_var <- readline(prompt = "Enter the column name to use for the design (e.g., 'LT_enrichment'): ")
+  design_formula <- as.formula(paste("~", design_var))
+  
+  dds <- DESeqDataSetFromMatrix(countData = expData, colData = metadata, design = design_formula)
+  dds <- DESeq(dds)
+  
+  res <- results(dds)
+  summary(res)
+  
+  as.data.frame(res)
+}
+
+boxplot_plot <- function(ncvsd, metadata, box_color = "steelblue", x_column = NULL, join_column = NULL) {
+  if (is.null(x_column)) {
+    cat("Available columns in metadata:\n")
+    print(colnames(metadata))
+    x_column <- readline(prompt = "Enter the column name for the X-axis: ")
+  }
+  
+  if (is.null(join_column)) {
+    join_column <- readline(prompt = "Enter the metadata column name that exactly matches the column names in expData:  ")
+  }
+  
+  if (!(x_column %in% colnames(metadata))) stop(paste("Error: Column", x_column, "does not exist in metadata."))
+  if (!(join_column %in% colnames(metadata))) stop(paste("Error: Column", join_column, "does not exist in metadata."))
+  
+  ncvsd_long <- ncvsd %>%
+    pivot_longer(cols = everything(), names_to = "sample", values_to = "expression") %>%
+    left_join(metadata, by = c("sample" = join_column))
+  
+  ggplot(ncvsd_long, aes(x = .data[[x_column]], y = expression, fill = "fixed_color")) +
+    geom_boxplot(outlier.shape = 16, outlier.size = 1.8, outlier.color = "black") +
+    scale_fill_manual(values = c("fixed_color" = box_color)) +
+    theme_minimal() +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, size = 1.2),
+      legend.position = "none",
+      axis.title.y = element_text(size = 14, face = "bold"),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+    ) +
+    xlab("Samples") +
+    ylab("Expression Level") +
+    ggtitle("Boxplot")
+}
+
+ruvseq_analysis <- function(res, expData, metadata, HKgenes_full) {
+  cat("Available columns in metadata:\n")
+  print(colnames(metadata))
+  
+  label_column <- readline(prompt = "Enter the name of the column to use for sample labels: ")
+  if (!label_column %in% colnames(metadata)) stop(paste("The column", label_column, "does not exist in the metadata."))
+  
+  population_column <- readline(prompt = "Enter the name of the column to use for defining colors in PCA (Population): ")
+  if (!population_column %in% colnames(metadata)) stop(paste("The column", population_column, "does not exist in the metadata."))
+  
+  sample_column <- readline(prompt = "Enter the name of the column to use for defining shapes in PCA (Sample) or press Enter to skip: ")
+  if (sample_column != "" && !sample_column %in% colnames(metadata)) stop(paste("The column", sample_column, "does not exist in the metadata."))
+  if (sample_column == "") sample_column <- NA
+  
+  boxplot_x_axis <- readline(prompt = "Enter the name of the column to use on the X-axis of the boxplot: ")
+  if (!boxplot_x_axis %in% colnames(metadata)) stop(paste("The column", boxplot_x_axis, "does not exist in the metadata."))
+  
+  join_column <- readline(prompt = "Enter the metadata column name that exactly matches the column names in expData:  ")
+  if (!join_column %in% colnames(metadata)) stop(paste("The column", join_column, "does not exist in the metadata."))
+  
+  for (p in seq(0.1, 0.9, by = 0.1)) {
+    output_pdf <- paste0("RUVseq_results_p_", p, ".pdf")
+    pdf(output_pdf)
+    
+    nDEGs <- rownames(res[res$pvalue >= p, ])
+    controlGenes <- intersect(nDEGs, HKgenes_full$Ensembl_biomart)
+    
+    for (k in 1:5) {
+      ruv_result <- RUVg(as.matrix(expData), controlGenes, k = k)
+      N <- ruv_result$normalizedCounts
+      
+      vsd_data <- deseq_vst(N, metadata)
+      
+      N_log <- as.data.frame(log2(N + 1))
+      print(boxplot_plot(N_log, metadata, box_color = "steelblue", x_column = boxplot_x_axis, join_column = join_column))
+      
+      pca_result <- perform_pca(vsd_data, metadata, population_column, sample_column)
+      print(pca_result$pca_plot + ggtitle(paste("PCA - p =", p, ", k =", k)))
+      
+      heatmap_plot(vsd_data, metadata, title = paste("Heatmap - p =", p, ", k =", k), label_column = label_column)
+      sampleClustering_plot(vsd_data, metadata, label_column = label_column, method = "average", cex_labels = 0.7)
+    }
+    
+    dev.off()
+  }
+}
+
+normalize_data <- function(res, expData, metadata, HKgenes) {
+  p <- as.numeric(readline(prompt = "Enter the p-value you want to use (e.g., 0.2): "))
+  k <- as.integer(readline(prompt = "Enter the k-value you want to use (e.g., 1): "))
+  
+  if (p < 0 || p > 1) stop("The p-value must be between 0 and 1.")
+  if (k < 1 || k > 5) stop("The k-value must be between 1 and 5.")
+  
+  nDEGs_deseq <- rownames(res[res$pvalue >= p, ])
+  controlGenes <- intersect(nDEGs_deseq, HKgenes)
+  
+  if (length(controlGenes) == 0) stop("No control genes were found. Check the p-value and the housekeeping genes list.")
+  
+  RUV <- RUVg(as.matrix(expData), controlGenes, k = k)
+  as.data.frame(RUV$normalizedCounts)
+}
+
+# 0.5) Load data ---------------------------------------------------------------
+message("0.5) Downloading GEO metadata and reading expression matrix...")
+
+geo_id <- "GSE110968"
+
+gse <- tryCatch(
+  { getGEO(geo_id, GSEMatrix = TRUE) },
+  error = function(e) { stop("Failed to download GEO data. Check the geo_id and internet connection.") }
+)
+
+metadata <- pData(phenoData(gse[[1]]))
+
+# WARNING: you had this in your script (kept). Make sure you're not deleting samples.
+metadata <- metadata[-c(1:3), ]
+
+names(metadata)[names(metadata) == "data_processing.2"] <- "Genome_build"
+
+metadata <- metadata %>%
+  mutate(
+    Genome_build = case_when(
+      Genome_build == "Genome_build: hg38" ~ "GRCH38",
+      Genome_build == "Genome_build: hg19" ~ "GRCH19",
+      TRUE ~ as.character(Genome_build)
+    ),
+    LT_enrichment_fct = case_when(
+      str_detect(title, regex("ctrl", ignore_case = TRUE)) ~ "Control",
+      str_detect(title, regex("vpa",  ignore_case = TRUE)) ~ "VPA",
+      TRUE ~ NA_character_
+    ),
+    LT_enrichment = case_when(
+      LT_enrichment_fct == "Control" ~ 0,
+      LT_enrichment_fct == "VPA"     ~ 1,
+      TRUE ~ NA_real_
+    ),
+    Imunophenotype = case_when(
+      LT_enrichment_fct %in% c("Control", "VPA") ~ "CD34+",
+      TRUE ~ NA_character_
+    ),
+    Enrichment = case_when(
+      LT_enrichment_fct == "Control" ~ "Lower Enrichment",
+      LT_enrichment_fct == "VPA"     ~ "Upper Enrichment",
+      TRUE ~ NA_character_
+    ),
+    Cell_Source = "Cord Blood"
+  )
+
+# Initialize Ensembl mart once (used in ID conversion) ------------------------
+message("0.5) Initializing Ensembl mart (used for identifier conversion)...")
+mart <- tryCatch(
+  { useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl") },
+  error = function(e) {
+    message("Could not initialize biomaRt mart. Identifier conversion steps may fail if used.")
+    NULL
+  }
+)
+
+# Read expression data (.tsv.gz) ----------------------------------------------
+exp_file <- "DATA/GSE110968_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+separator <- detect_separator(exp_file)
+
+expDataRaw <- read.delim(gzfile(exp_file, "rt"), sep = separator, stringsAsFactors = FALSE)
+
+# Convert first column IDs to Ensembl -----------------------------------------
+expDataRaw2 <- convert_identifiers(expDataRaw, to_id = "Ensembl", mart = mart)
+
+# Keep only numeric columns as counts (robust) --------------------------------
+numeric_cols <- which(sapply(expDataRaw2, is.numeric))
+if (length(numeric_cols) == 0) stop("No numeric columns found in expression file after import.")
+
+expData <- expDataRaw2[, numeric_cols, drop = FALSE]
+rownames(expData) <- expDataRaw2$Ensembl
+expData <- expData[!duplicated(rownames(expData)), ]
+
+# Validate metadata rownames vs expData colnames ------------------------------
+message("0.5) Validating metadata rownames vs expression colnames...")
+if (all(rownames(metadata) %in% colnames(expData))) {
+  message("The column names in expData match the row names in metadata. Proceeding with the analysis.")
+} else {
+  message("The column names in expData do not match the row names in metadata.")
+  response <- readline(prompt = "Check if the row names of metadata match the column names of expData. Do they match? (yes/no) ")
+  
+  if (tolower(response) == "yes") {
+    colnames(expData) <- rownames(metadata)
+    message("Columns of expData successfully renamed based on metadata row names.")
+  } else if (tolower(response) == "no") {
+    message("Please manually reorganize the rows of metadata to match the columns of expData.")
+    message("After reorganizing, run the script again.")
+  } else {
+    message("Invalid response. Please answer 'yes' or 'no'. Proceeding without renaming columns.")
+  }
+}
+
+message("0.5) Saving processed metadata and raw counts...")
+write.csv(metadata, file = "DATA/metadata.csv")
+write.csv(expData, file = "DATA/raw_counts.csv")
+
+#### 1) Deliverable 1: Data preprocessing #####################################
+
+message("1) Filtering and preprocessing data...")
+
+# 1.1) Remove genes with zero counts ------------------------------------------
+dds <- DESeqDataSetFromMatrix(countData = expData, colData = metadata, design = ~ 1)
+expData <- dds[rowSums(counts(dds)) > 0, ]
+expData <- as.data.frame(assay(expData))
+
+# 1.2) Remove genes with TPM < 1 ----------------------------------------------
+expData <- filter_genes_by_tpm(expData, metadata)
+expData2a <- expData
+
+#### 2) Deliverable 2: Quality control ########################################
+
+message("2) Running QC (VST, boxplot, PCA, heatmap, clustering)...")
+
+ncvsd <- deseq_vst(expData2a, metadata)
+
+# 2.1) Boxplot -----------------------------------------------------------------
+boxplot_plot_obj <- boxplot_plot(ncvsd, metadata)
+print(boxplot_plot_obj)
+
+# 2.2) PCA ---------------------------------------------------------------------
+pca_results <- perform_pca(ncvsd, metadata)
+pca_plot_obj <- pca_results$pca_plot
+print(pca_results$pca_data)
+print(pca_plot_obj)
+
+# 2.3) Heatmap -----------------------------------------------------------------
+heatmap_plot_obj <- heatmap_plot(ncvsd, metadata)
+
+# 2.4) Sample clustering -------------------------------------------------------
+sampleClustering_plot(ncvsd, metadata)
+
+message("2) Exporting QC panel to PDF...")
+pdf("RESULTS/Quality_Control/3_QC_withoutOutliers.pdf", width = 8, height = 6)
+
+print(boxplot_plot_obj)
+print(pca_plot_obj)
+grid.newpage()
+
+print(heatmap_plot_obj)
+sampleClustering_plot(ncvsd, metadata)
+
+dev.off()
+
+# Interactive QC decision tree (outliers / batch effects) ----------------------
+repeat {
+  
+  outlier_resp <- tolower(readline("After the analysis, do you have any outlier samples? (Yes/No): "))
+  
+  if (outlier_resp == "yes") {
+    message("Go back to the metadata and expData, remove the outliers, and run the analysis again.")
+    break
+  } else if (outlier_resp == "no") {
+    repeat {
+      batch_resp <- tolower(readline("Does your data have batch effects? (Yes/No): "))
+      
+      if (batch_resp == "yes") {
+        message("Proceed to Run RUVseq for batch effect removal.")
+        break
+      } else if (batch_resp == "no") {
+        message("Quality control completed. Save the expData")
+        break
+      } else {
+        message("Invalid response. Please enter 'Yes' or 'No'.")
+      }
+    }
+    break
+  } else {
+    message("Invalid response. Please enter 'Yes' or 'No'.")
+  }
+}
+
+#### 3) Deliverable 3: RUVseq normalization & low-variance filtering ###########
+
+metadata$LT_enrichment <- as.factor(metadata$LT_enrichment)
+res <- differential_expression_analysis(expData2a, metadata)
+
+HKgenes_full <- read.csv("DATA/HK_full_gene_list_ensembl_biomart.csv")
+
+ruvseq_analysis(res, expData2a, metadata, HKgenes_full)
+
+# Metrics: Batch Correction p-value Threshold: 0.2;  k Value: 1 
+expData <- normalize_data(res, expData2a, metadata, HKgenes_full$Ensembl_biomart)
+
+write.csv(expData, file="DATA/counts_final.csv")
+
